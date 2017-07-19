@@ -1,19 +1,37 @@
-// Copyright (c) 2014-2015 The Notify Authors. All rights reserved.
+// Copyright (c) 2017 Radosław Kintzi. All rights reserved.
 // Use of this source code is governed by the MIT license that can be
 // found in the LICENSE file.
+//
+// Part of this file (a read() method of Watcher) was copied
+// and adopted from
+// https://github.com/fsnotify/fsnotify/blob/master/inotify.go
 
 // +build linux
 
 package inotify
 
 import (
+	"errors"
+	"fmt"
+	"io"
 	"runtime"
 	"strings"
+	"sync"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
 type Flags uint32
+type Event struct {
+	Path  []string
+	Dir   string
+	Flags Flags
+}
+
+var (
+	ErrOverflow = fmt.Errorf("Inotify event queue overflow")
+)
 
 // Inotify specific masks are legal, implemented events that are guaranteed to
 // work with notify package on linux-based systems.
@@ -78,10 +96,11 @@ type Watcher struct {
 	efd   int
 	pipe  []int
 	paths map[string]int
-	fds   map[int]string
+	fds   map[int]map[string]bool
 	evts  chan<- Flags
 	errs  chan<- error
 	done  chan struct{}
+	mu    sync.Mutex
 }
 
 func New(events chan<- Flags, errors chan<- error) (*Watcher, error) {
@@ -91,7 +110,7 @@ func New(events chan<- Flags, errors chan<- error) (*Watcher, error) {
 		efd:   -1,
 		pipe:  []int{-1, -1},
 		paths: make(map[string]int),
-		fds:   make(map[int]string),
+		fds:   make(map[int]map[string]bool),
 		evts:  events, errs: errors,
 		done: make(chan struct{}),
 	}
@@ -133,17 +152,20 @@ func (w *Watcher) Add(path string, flags Flags) error {
 	if err != nil {
 		return err
 	}
+	w.mu.Lock()
 	w.paths[path] = fd
-	w.fds[fd] = path
+	w.fds[fd][path] = true
+	w.mu.Unlock()
 	return nil
 }
 
 func (w *Watcher) Close() {
-	if w.pipe[0] == -1 {
+	if w.pipe[1] == -1 {
 		return
 	}
-	unix.Close(w.pipe[1])
-	w.pipe[0] = -1
+	fd := w.pipe[1]
+	w.pipe[1] = -1
+	unix.Close(fd)
 	<-w.done
 	w.close()
 }
@@ -177,4 +199,81 @@ func (w *Watcher) wait() {
 	close(w.done)
 }
 
-func (w *Watcher) read() {}
+func (w *Watcher) read() {
+	var buf [unix.SizeofInotifyEvent * 4096]byte
+	n, errno := unix.Read(w.ifd, buf[:])
+	// If syscall was interupted with a signal,
+	// we can simply return as we should be woken agein in w.wait().
+	// "Before Linux 3.8, reads from an inotify(7) file descriptor were not restartable"
+	if errno == unix.EINTR {
+		return
+	}
+
+	if n < unix.SizeofInotifyEvent {
+		var err error
+		if n == 0 {
+			// EOF? - this should really never happen.
+			err = io.EOF
+		} else if n < 0 {
+			// If an error occurred while reading.
+			// Maybe we should return an error and abort instead of signaling it
+			err = errno
+		} else {
+			// Read was too short.
+			err = errors.New("notify: short read in readEvents()")
+		}
+		select {
+		case w.errs <- err:
+		default:
+			// If no one is interested simply discard
+		}
+		return
+	}
+
+	var offset uint32
+	// We don't know how many events we just read into the buffer
+	// While the offset points to at least one whole event...
+	for offset <= uint32(n-unix.SizeofInotifyEvent) {
+		raw := (*unix.InotifyEvent)(unsafe.Pointer(&buf[offset]))
+		mask := uint32(raw.Mask)
+		nameLen := uint32(raw.Len)
+
+		if mask&unix.IN_Q_OVERFLOW != 0 {
+			select {
+			case w.errs <- ErrOverflow:
+			default:
+			}
+			return
+		}
+
+		w.mu.Lock()
+		names, ok := w.fds[int(raw.Wd)]
+		// IN_DELETE_SELF occurs when the file/directory being watched is removed.
+		// This is a sign to clean up the maps, otherwise we are no longer in sync
+		// with the inotify kernel state which has already deleted the watch
+		// automatically.
+		if ok && mask&unix.IN_DELETE_SELF == unix.IN_DELETE_SELF {
+			delete(w.fds, int(raw.Wd))
+			for name := range names {
+				delete(w.paths, name)
+			}
+		}
+		w.mu.Unlock()
+
+		var name string
+		if nameLen > 0 {
+			// Point "bytes" at the first byte of the filename
+			bytes := (*[unix.PathMax]byte)(unsafe.Pointer(&buf[offset+unix.SizeofInotifyEvent]))
+			// The filename is padded with NULL bytes. TrimRight() gets rid of those.
+			name = "/" + strings.TrimRight(string(bytes[0:nameLen]), "\000")
+		}
+
+		for _, event := range newEvents(names, name, mask) {
+			select {
+			case w.evts <- event:
+			default:
+			}
+		}
+		offset += unix.SizeofInotifyEvent + nameLen
+	}
+}
